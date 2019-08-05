@@ -1,0 +1,129 @@
+import json
+import os
+import glob
+import time
+from botocore.vendored import requests
+import datetime
+import hashlib
+import hmac
+import sys
+
+# ************* REQUEST VALUES *************
+method = 'POST'
+service = 'comprehend'
+host = 'comprehend.eu-west-1.amazonaws.com'
+target  = 'Comprehend_20171127.DetectSentiment'
+region = 'eu-west-1'
+endpoint = 'https://comprehend.eu-west-1.amazonaws.com/'
+#request_text = 'i want to book a hotel' # request text
+access_key = 'xxxxxxxxxxxxxx'
+secret_key = 'xxxxxxxxxxxxxxx' #client and secret key for Comprehend user
+user = 'iot@zendesk.test' + '/token'
+api_token = 'xxxxxxxxxxxxxxxx'
+ZenHeaders = {'content-type': 'application/json'}
+
+
+# Key derivation functions. See:
+# http://docs.aws.amazon.com/general/latest/gr/signature-v4-examples.html#signature-v4-examples-python
+def sign(key, msg):
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+def getSignatureKey(key, dateStamp, regionName, serviceName):
+    kDate = sign(("AWS4" + key).encode("utf-8"), dateStamp)
+    kRegion = sign(kDate, regionName)
+    kService = sign(kRegion, serviceName)
+    kSigning = sign(kService, "aws4_request")
+    return kSigning
+
+def lambda_handler(event, context):
+    #This part receives the ticket event from the AWS Events bridge and parses for some key information
+    print('received event from Zendesk:' + json.dumps(event))
+    ZeventType = event['detail-type']
+    Zid = event['detail']['ticket_event']['ticket']['id']
+    TicketID = str(Zid) #change int to string so that it can be used as part of the URL
+    is_Public = event['detail']['ticket_event']['comment']['is_public'] #this gets Public (Trie or false)
+    Zcomment = event['detail']['ticket_event']['comment']['body'] #this gets the body of the update
+    print ('' + ZeventType)
+    print ('' + Zcomment)
+    
+    #This logical function checks to see whether a) the ticket event is 'comment created' and b) if the comment is public. If Internal note we don't run analysis (loop)
+    if ZeventType == 'Support Ticket: Comment Created' and is_Public== True: #If it's a new comment and public then run sentiment analysis and submit the result to the same ticket as an internal note
+        #Setup the Comprehend JSON body
+        parameters = {"LanguageCode": "en", "Text":Zcomment}
+        string_params =json.dumps(parameters)
+        request_parameters = string_params.encode('utf-8')
+        content_type = 'application/x-amz-json-1.1'
+        target  = 'Comprehend_20171127.DetectSentiment'
+        # Create a date for headers and the credential string
+        t = datetime.datetime.utcnow()
+        amz_date = t.strftime('%Y%m%dT%H%M%SZ')#'20170714T010101Z'
+        date_stamp = t.strftime('%Y%m%d') # Date w/o time, used in credential scope  '20170714'
+        
+        canonical_uri = '/'
+        canonical_querystring = ''
+        payload_hash = hashlib.sha256(request_parameters).hexdigest()
+        canonical_headers = 'content-type:' + content_type + '\n' + 'host:' + host + '\n' + 'x-amz-content-sha256:' + payload_hash + '\n' + 'x-amz-date:' + amz_date + '\n' + 'x-amz-target:' + target + '\n'
+        signed_headers = 'content-type;host;x-amz-content-sha256;x-amz-date;x-amz-target'
+    
+    
+    #Combine elements to create create canonical request
+        canonical_request = method + '\n' + canonical_uri + '\n' + canonical_querystring + '\n' + canonical_headers + '\n' + signed_headers + '\n' + payload_hash
+        encoded_cr = canonical_request.encode('utf-8')
+    
+    # *************CREATE THE STRING TO SIGN*************
+    # Match the algorithm to the hashing algorithm you use, either SHA-1 or
+        # SHA-256 (recommended)
+        algorithm = 'AWS4-HMAC-SHA256'
+        credential_scope = date_stamp + '/' + region + '/' + service + '/' + 'aws4_request'
+        string_to_sign = algorithm + '\n' +  amz_date + '\n' +  credential_scope + '\n' +  hashlib.sha256(encoded_cr).hexdigest()
+    # *************CALCULATE THE SIGNATURE *************
+    # Create the signing key using the function defined above.
+        signing_key = getSignatureKey(secret_key, date_stamp, region, service)
+    
+    # Sign the string_to_sign using the signing_key
+        signature = hmac.new(signing_key, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
+        #signature = hmac.new(b'{signing_key}', string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
+    # *************ADD SIGNING INFORMATION TO THE REQUEST *************
+    # Put the signature information in a header named Authorization.
+        authorization_header = algorithm + ' ' + 'Credential=' + access_key + '/' + credential_scope + ', ' +  'SignedHeaders=' + signed_headers + ', ' + 'Signature=' + signature
+        headers = {'Content-Type':content_type,
+                   'X-Amz-Date':amz_date,
+                   'X-Amz-content-Sha256' :payload_hash,
+                   'X-Amz-target':'Comprehend_20171127.DetectSentiment',
+                   'Authorization':authorization_header}
+        
+        
+        
+        # ************* SEND THE REQUEST to AWS Comprehend *************
+        print ('\nBEGIN REQUEST++++++++++++++++++++++++++++++++++++')
+        print ('Request URL = ' + endpoint)
+        print('\n' + authorization_header)
+        print('\nX-Amz-content-Sha256 header is' + payload_hash)
+        
+        r = requests.post(endpoint + canonical_uri, data=request_parameters, headers=headers)
+        data = r.json()
+        #comprehend_message = data['message']
+        #print ('' + comprehend_message)
+        #print('the response is' + json.dumps(data))
+        ZSentiment = data['Sentiment']
+        print('the sentiment is' + json.dumps(ZSentiment))
+        
+        #Update the relevant Zendesk Ticket with an internal comment
+        data = {"ticket":{"comment": { "body": ZSentiment, "public": 0}}} #send an internal comment with the sentiment
+
+        # Encode the data to create a JSON payload
+        payload = json.dumps(data)
+    
+        # Set the request parameters
+        url = 'https://z3ndem.zendesk.com/api/v2/tickets/' + TicketID
+    
+        # Do the HTTP post request
+        response = requests.put(url, data=payload, auth=(user, api_token), headers=ZenHeaders)
+    
+    else:
+        print("Either the event type was not Comment created or the comment was Internal - hence we bailed :)")
+    
+    return {
+        'statusCode': 200,
+        'body': json.dumps('Hello from Lambda!')
+    }
